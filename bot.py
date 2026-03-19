@@ -21,7 +21,7 @@ class SessionState:
     initial_bankroll: float = 50000.0
     history: list[float] = field(default_factory=list)
     pending_add: bool = False
-    last_check_at: datetime | None = None
+    last_report_at: datetime | None = None
 
 
 sessions: dict[int, SessionState] = {}
@@ -41,10 +41,10 @@ def fmt_time(dt: datetime) -> str:
     return dt.strftime("%H:%M:%S")
 
 
-def build_keyboard() -> InlineKeyboardMarkup:
+def keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📈 GET STATUS", callback_data="status")],
+            [InlineKeyboardButton(text="📊 SHOW REPORT", callback_data="report")],
             [InlineKeyboardButton(text="➕ Add Multiplier", callback_data="add")],
             [InlineKeyboardButton(text="💰 Bankroll", callback_data="bankroll")],
             [InlineKeyboardButton(text="🧹 Reset History", callback_data="reset")],
@@ -52,44 +52,57 @@ def build_keyboard() -> InlineKeyboardMarkup:
     )
 
 
-def summarize(history: list[float]) -> str:
-    if len(history) < 5:
-        return "📊 Add at least 5 multipliers first."
-
+def clean_recent(history: list[float]) -> list[float]:
     recent = history[-5:]
+    return [x for x in recent if x > 0]
+
+
+def build_report(state: SessionState) -> str:
+    if len(state.history) < 5:
+        return (
+            "📊 Not enough data yet.\n\n"
+            "Add at least 5 multipliers first."
+        )
+
+    recent = clean_recent(state.history)
+    if len(recent) < 3:
+        return "⚠️ Too little clean data to summarize."
+
     avg = sum(recent) / len(recent)
     low_count = sum(1 for x in recent if x <= 1.5)
-    high_count = sum(1 for x in recent if x >= 2.0)
+    mid_count = sum(1 for x in recent if 1.5 < x <= 2.5)
+    high_count = sum(1 for x in recent if x > 2.5)
+
+    if avg < 1.6:
+        trend = "Low activity"
+    elif avg <= 2.5:
+        trend = "Mixed activity"
+    else:
+        trend = "High activity"
 
     return (
+        f"📈 Report\n\n"
+        f"Trend: {trend}\n"
         f"Last 5: {recent}\n"
         f"Average: {avg:.2f}\n"
         f"Low rounds (≤1.5): {low_count}\n"
-        f"Higher rounds (≥2.0): {high_count}"
+        f"Mid rounds (1.5–2.5): {mid_count}\n"
+        f"High rounds (>2.5): {high_count}\n\n"
+        f"Use this only as a log, not as a prediction."
     )
-
-
-def cooldown_text(state: SessionState) -> str:
-    now = datetime.now()
-
-    if state.last_check_at is None:
-        next_time = now
-    else:
-        next_time = state.last_check_at + timedelta(minutes=COOLDOWN_MINUTES)
-
-    return fmt_time(next_time)
 
 
 @router.message(Command("start"))
 async def start(msg: types.Message):
     state = get_state(msg.chat.id)
     text = (
-        "🚀 Bot ready\n\n"
+        "✅ Session Tracker Ready\n\n"
         f"Bankroll: {money(state.bankroll)}\n"
-        f"Cooldown: {COOLDOWN_MINUTES} minutes\n\n"
-        "Tap a button below."
+        f"Cooldown: {COOLDOWN_MINUTES} minutes\n"
+        f"Stored multipliers: {len(state.history)}\n\n"
+        "Use the buttons below."
     )
-    await msg.answer(text, reply_markup=build_keyboard())
+    await msg.answer(text, reply_markup=keyboard())
 
 
 @router.callback_query(F.data == "add")
@@ -100,45 +113,48 @@ async def add_prompt(c: types.CallbackQuery):
     await c.message.answer("Send one multiplier now, like 1.45 or 2.30.")
 
 
-@router.callback_query(F.data == "status")
-async def status(c: types.CallbackQuery):
+@router.callback_query(F.data == "report")
+async def report(c: types.CallbackQuery):
     state = get_state(c.message.chat.id)
     now = datetime.now()
 
-    if state.last_check_at is not None:
-        next_allowed = state.last_check_at + timedelta(minutes=COOLDOWN_MINUTES)
+    if state.last_report_at is not None:
+        next_allowed = state.last_report_at + timedelta(minutes=COOLDOWN_MINUTES)
         if now < next_allowed:
-            wait_seconds = int((next_allowed - now).total_seconds())
-            minutes = wait_seconds // 60
-            seconds = wait_seconds % 60
-            await c.answer("Cooldown active", show_alert=False)
+            wait = next_allowed - now
+            minutes = int(wait.total_seconds()) // 60
+            seconds = int(wait.total_seconds()) % 60
+            await c.answer()
             await c.message.answer(
-                f"⏳ Please wait {minutes}m {seconds}s.\n"
-                f"Next check time: {fmt_time(next_allowed)}"
+                f"⏳ Cooldown active.\n"
+                f"Wait {minutes}m {seconds}s.\n"
+                f"Next report at {fmt_time(next_allowed)}."
             )
             return
 
-    state.last_check_at = now
+    state.last_report_at = now
     await c.answer()
 
     text = (
         f"🕒 Time: {fmt_time(now)}\n"
-        f"⏳ Next check allowed after: {fmt_time(now + timedelta(minutes=COOLDOWN_MINUTES))}\n\n"
+        f"⏳ Next report after: {fmt_time(now + timedelta(minutes=COOLDOWN_MINUTES))}\n\n"
         f"Bankroll: {money(state.bankroll)}\n"
         f"History count: {len(state.history)}\n\n"
-        f"{summarize(state.history)}\n\n"
-        "Use the cooldown to add fresh data calmly."
+        f"{build_report(state)}"
     )
-    await c.message.answer(text, reply_markup=build_keyboard())
+    await c.message.answer(text, reply_markup=keyboard())
 
 
 @router.callback_query(F.data == "bankroll")
 async def bankroll(c: types.CallbackQuery):
     state = get_state(c.message.chat.id)
+    profit = state.bankroll - state.initial_bankroll
+    signed = f"+{money(profit)}" if profit >= 0 else f"-{money(abs(profit))}"
     await c.answer()
     await c.message.answer(
         f"💰 Bankroll: {money(state.bankroll)}\n"
         f"Initial: {money(state.initial_bankroll)}\n"
+        f"Net change: {signed}\n"
         f"Stored multipliers: {len(state.history)}"
     )
 
@@ -147,10 +163,10 @@ async def bankroll(c: types.CallbackQuery):
 async def reset_history(c: types.CallbackQuery):
     state = get_state(c.message.chat.id)
     state.history.clear()
-    state.last_check_at = None
     state.pending_add = False
-    await c.answer("Reset done")
-    await c.message.answer("🧹 History cleared.")
+    state.last_report_at = None
+    await c.answer("Reset complete")
+    await c.message.answer("🧹 History cleared.", reply_markup=keyboard())
 
 
 @router.message()
@@ -160,8 +176,8 @@ async def handle_text(msg: types.Message):
     if not state.pending_add:
         return
 
-    text = (msg.text or "").strip().lower().replace(",", ".")
-    match = re.search(r"\d+(?:\.\d+)?", text)
+    raw = (msg.text or "").strip().replace(",", ".")
+    match = re.search(r"\d+(?:\.\d+)?", raw)
 
     if not match:
         await msg.answer("Send a valid number like 1.45")
@@ -170,7 +186,7 @@ async def handle_text(msg: types.Message):
     try:
         value = float(match.group())
         if value <= 0:
-            raise ValueError("Multiplier must be positive")
+            raise ValueError("Invalid multiplier")
 
         state.history.append(value)
         if len(state.history) > 200:
@@ -181,7 +197,7 @@ async def handle_text(msg: types.Message):
         await msg.answer(
             f"✅ Added {value}x\n"
             f"Stored total: {len(state.history)}\n"
-            f"Now tap GET STATUS when you want the next timed check."
+            f"Tap SHOW REPORT when you want a summary."
         )
     except Exception:
         await msg.answer("Send a valid number like 1.45")
