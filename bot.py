@@ -7,7 +7,7 @@ from aiogram import Bot, Dispatcher, F, Router, types
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
-TOKEN = "PASTE_YOUR_TOKEN_HERE"
+TOKEN = "8654750538:AAGlG30RTn6mgIo7Ss-34hBw_EcgrWcQeyc"
 COOLDOWN_MINUTES = 3
 
 bot = Bot(token=TOKEN)
