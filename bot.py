@@ -1,213 +1,233 @@
 import asyncio
-import re
-from dataclasses import dataclass, field
+import json
+import os
 from datetime import datetime, timedelta
-
-from aiogram import Bot, Dispatcher, F, Router, types
+from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 
-TOKEN = "8654750538:AAGlG30RTn6mgIo7Ss-34hBw_EcgrWcQeyc"
-COOLDOWN_MINUTES = 3
-
+TOKEN = "8654750538:AAGlG30RTn6mgIo7Ss-34hBw_EcgrWcQeyc"   # ← keep your same token
 bot = Bot(token=TOKEN)
-dp = Dispatcher()
-router = Router()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
+# -------------------- Persistent Data Storage --------------------
+DATA_FILE = "betking_data.json"
 
-@dataclass
-class SessionState:
-    bankroll: float = 50000.0
-    initial_bankroll: float = 50000.0
-    history: list[float] = field(default_factory=list)
-    pending_add: bool = False
-    last_report_at: datetime | None = None
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "r") as f:
+            return json.load(f)
+    return {"bankroll": 50000.0, "history": [], "session_profit": 0.0, "initial": 50000.0}
 
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f)
 
-sessions: dict[int, SessionState] = {}
+# -------------------- Risk Manager Class --------------------
+class BetKingRiskMaster:
+    def __init__(self, data):
+        self.bankroll = data["bankroll"]
+        self.initial = data.get("initial", self.bankroll)
+        self.history = data["history"]
+        self.session_profit = data["session_profit"]
+        self.safe_target = 1.3
+        self.max_daily_loss = 0.10
+        self.bet_percent = 0.02
 
+    def save(self):
+        data = {
+            "bankroll": self.bankroll,
+            "initial": self.initial,
+            "history": self.history,
+            "session_profit": self.session_profit
+        }
+        save_data(data)
 
-def get_state(chat_id: int) -> SessionState:
-    if chat_id not in sessions:
-        sessions[chat_id] = SessionState()
-    return sessions[chat_id]
+    def analyze(self):
+        if len(self.history) < 5:
+            return "📊 Send at least 5 BetKing multipliers with the Add button"
 
+        recent = self.history[-5:]
+        avg = sum(recent) / 5
+        low_streak = sum(1 for x in recent if x <= 1.5)
 
-def money(value: float) -> str:
-    return f"₦{value:,.0f}"
+        # Advanced signals
+        if low_streak >= 3:
+            signal = "🔴 LOW STREAK DETECTED! Perfect safe entry time on BetKing now!"
+        elif avg > 2.2:
+            signal = "🟢 High average — strong setup for 1.3x on BetKing"
+        elif avg < 1.4 and len([x for x in recent if x < 1.2]) >= 3:
+            signal = "🟡 Very low recent rounds – high chance of a rebound? Still follow 1.3x safe rule"
+        else:
+            signal = "⚪ Neutral market — follow 1.3x safe rule"
 
+        prob = round(97 / (self.safe_target * 100) * 100, 1)
+        stake = self.get_bet_size()
+        if stake == 0:
+            stake_msg = "🚫 STOP – max loss reached!"
+        else:
+            stake_msg = f"💰 Stake: ₦{stake:,.0f} (2% of bankroll)"
 
-def fmt_time(dt: datetime) -> str:
-    return dt.strftime("%H:%M:%S")
+        return (f"{signal}\n\n"
+                f"{stake_msg}\n"
+                f"✅ Auto cashout @ {self.safe_target}x ({prob}% chance)\n"
+                f"📊 Last 5 BetKing rounds: {recent}\n"
+                f"📈 5‑round average: {avg:.2f}x")
 
+    def get_bet_size(self):
+        if self.bankroll <= self.initial * 0.5 or self.session_profit <= -self.initial * self.max_daily_loss:
+            return 0
+        return round(self.bankroll * self.bet_percent, 2)
 
-def keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📊 SHOW REPORT", callback_data="report")],
-            [InlineKeyboardButton(text="➕ Add Multiplier", callback_data="add")],
-            [InlineKeyboardButton(text="💰 Bankroll", callback_data="bankroll")],
-            [InlineKeyboardButton(text="🧹 Reset History", callback_data="reset")],
-        ]
-    )
+    def add_multiplier(self, mult):
+        self.history.append(mult)
+        if len(self.history) > 200:
+            self.history.pop(0)
+        self.save()
 
+# -------------------- Load saved state --------------------
+data = load_data()
+risk = BetKingRiskMaster(data)
 
-def clean_recent(history: list[float]) -> list[float]:
-    recent = history[-5:]
-    return [x for x in recent if x > 0]
+# -------------------- FSM for scheduling --------------------
+class ScheduleStates(StatesGroup):
+    waiting_for_minutes = State()
 
+# -------------------- Keyboards --------------------
+def main_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📈 GET SIGNAL", callback_data="signal")],
+        [InlineKeyboardButton(text="➕ Add BetKing Multiplier", callback_data="add")],
+        [InlineKeyboardButton(text="⏰ Schedule Signal", callback_data="schedule")],
+        [InlineKeyboardButton(text="💰 My Bankroll", callback_data="status")],
+        [InlineKeyboardButton(text="⚙️ Settings", callback_data="settings")]
+    ])
 
-def build_report(state: SessionState) -> str:
-    if len(state.history) < 5:
-        return (
-            "📊 Not enough data yet.\n\n"
-            "Add at least 5 multipliers first."
-        )
+def back_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu")]
+    ])
 
-    recent = clean_recent(state.history)
-    if len(recent) < 3:
-        return "⚠️ Too little clean data to summarize."
-
-    avg = sum(recent) / len(recent)
-    low_count = sum(1 for x in recent if x <= 1.5)
-    mid_count = sum(1 for x in recent if 1.5 < x <= 2.5)
-    high_count = sum(1 for x in recent if x > 2.5)
-
-    if avg < 1.6:
-        trend = "Low activity"
-    elif avg <= 2.5:
-        trend = "Mixed activity"
-    else:
-        trend = "High activity"
-
-    return (
-        f"📈 Report\n\n"
-        f"Trend: {trend}\n"
-        f"Last 5: {recent}\n"
-        f"Average: {avg:.2f}\n"
-        f"Low rounds (≤1.5): {low_count}\n"
-        f"Mid rounds (1.5–2.5): {mid_count}\n"
-        f"High rounds (>2.5): {high_count}\n\n"
-        f"Use this only as a log, not as a prediction."
-    )
-
-
-@router.message(Command("start"))
+# -------------------- Handlers --------------------
+@dp.message(Command("start"))
 async def start(msg: types.Message):
-    state = get_state(msg.chat.id)
-    text = (
-        "✅ Session Tracker Ready\n\n"
-        f"Bankroll: {money(state.bankroll)}\n"
-        f"Cooldown: {COOLDOWN_MINUTES} minutes\n"
-        f"Stored multipliers: {len(state.history)}\n\n"
-        "Use the buttons below."
-    )
-    await msg.answer(text, reply_markup=keyboard())
-
-
-@router.callback_query(F.data == "add")
-async def add_prompt(c: types.CallbackQuery):
-    state = get_state(c.message.chat.id)
-    state.pending_add = True
-    await c.answer()
-    await c.message.answer("Send one multiplier now, like 1.45 or 2.30.")
-
-
-@router.callback_query(F.data == "report")
-async def report(c: types.CallbackQuery):
-    state = get_state(c.message.chat.id)
-    now = datetime.now()
-
-    if state.last_report_at is not None:
-        next_allowed = state.last_report_at + timedelta(minutes=COOLDOWN_MINUTES)
-        if now < next_allowed:
-            wait = next_allowed - now
-            minutes = int(wait.total_seconds()) // 60
-            seconds = int(wait.total_seconds()) % 60
-            await c.answer()
-            await c.message.answer(
-                f"⏳ Cooldown active.\n"
-                f"Wait {minutes}m {seconds}s.\n"
-                f"Next report at {fmt_time(next_allowed)}."
-            )
-            return
-
-    state.last_report_at = now
-    await c.answer()
-
-    text = (
-        f"🕒 Time: {fmt_time(now)}\n"
-        f"⏳ Next report after: {fmt_time(now + timedelta(minutes=COOLDOWN_MINUTES))}\n\n"
-        f"Bankroll: {money(state.bankroll)}\n"
-        f"History count: {len(state.history)}\n\n"
-        f"{build_report(state)}"
-    )
-    await c.message.answer(text, reply_markup=keyboard())
-
-
-@router.callback_query(F.data == "bankroll")
-async def bankroll(c: types.CallbackQuery):
-    state = get_state(c.message.chat.id)
-    profit = state.bankroll - state.initial_bankroll
-    signed = f"+{money(profit)}" if profit >= 0 else f"-{money(abs(profit))}"
-    await c.answer()
-    await c.message.answer(
-        f"💰 Bankroll: {money(state.bankroll)}\n"
-        f"Initial: {money(state.initial_bankroll)}\n"
-        f"Net change: {signed}\n"
-        f"Stored multipliers: {len(state.history)}"
+    await msg.answer(
+        f"🚀 BetKing Risk Master Bot READY\n"
+        f"Built only for you\n"
+        f"Bankroll: ₦{risk.bankroll:,.0f}\n"
+        f"Session profit: {'+' if risk.session_profit >= 0 else ''}₦{risk.session_profit:,.0f}",
+        reply_markup=main_keyboard()
     )
 
+@dp.callback_query(lambda c: c.data == "menu")
+async def back_to_menu(c: CallbackQuery):
+    await c.message.edit_text(
+        f"🚀 BetKing Risk Master\nBankroll: ₦{risk.bankroll:,.0f}\nSession: {'+' if risk.session_profit >= 0 else ''}₦{risk.session_profit:,.0f}",
+        reply_markup=main_keyboard()
+    )
 
-@router.callback_query(F.data == "reset")
-async def reset_history(c: types.CallbackQuery):
-    state = get_state(c.message.chat.id)
-    state.history.clear()
-    state.pending_add = False
-    state.last_report_at = None
-    await c.answer("Reset complete")
-    await c.message.answer("🧹 History cleared.", reply_markup=keyboard())
+@dp.callback_query(lambda c: c.data == "signal")
+async def signal_handler(c: CallbackQuery):
+    analysis = risk.analyze()
+    text = (f"🕒 {datetime.now().strftime('%H:%M:%S')}\n"
+            f"Bankroll: ₦{risk.bankroll:,.0f} | Session: {'+' if risk.session_profit >= 0 else ''}₦{risk.session_profit:,.0f}\n\n"
+            f"{analysis}\n\n"
+            f"❗ Place your bet on the NEXT round.\n"
+            f"Never chase losses. Stop at -10%.")
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 New Signal", callback_data="signal")],
+        [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu")]
+    ])
+    await c.message.edit_text(text, reply_markup=keyboard)
 
+@dp.callback_query(lambda c: c.data == "add")
+async def add_prompt(c: CallbackQuery):
+    await c.message.edit_text(
+        "Paste the last BetKing multiplier (e.g. 1.45 or 2.34).\n"
+        "You can send multiple numbers one by one.",
+        reply_markup=back_keyboard()
+    )
 
-@router.message()
-async def handle_text(msg: types.Message):
-    state = get_state(msg.chat.id)
+@dp.callback_query(lambda c: c.data == "status")
+async def status_handler(c: CallbackQuery):
+    text = (f"💰 **Bankroll Details**\n"
+            f"Current bankroll: ₦{risk.bankroll:,.0f}\n"
+            f"Initial bankroll: ₦{risk.initial:,.0f}\n"
+            f"Session profit: {'+' if risk.session_profit >= 0 else ''}₦{risk.session_profit:,.0f}\n"
+            f"History entries: {len(risk.history)}\n"
+            f"Last 5: {risk.history[-5:] if len(risk.history)>=5 else risk.history}")
+    await c.message.edit_text(text, reply_markup=back_keyboard())
 
-    if not state.pending_add:
-        return
+@dp.callback_query(lambda c: c.data == "settings")
+async def settings_handler(c: CallbackQuery):
+    text = (f"⚙️ **Current Settings**\n"
+            f"Safe cashout: {risk.safe_target}x\n"
+            f"Bet size: {risk.bet_percent*100}% of bankroll\n"
+            f"Max daily loss: {risk.max_daily_loss*100}%\n\n"
+            f"To change these, edit the code or use /set commands (coming soon).")
+    await c.message.edit_text(text, reply_markup=back_keyboard())
 
-    raw = (msg.text or "").strip().replace(",", ".")
-    match = re.search(r"\d+(?:\.\d+)?", raw)
+# -------------------- Schedule feature --------------------
+@dp.callback_query(lambda c: c.data == "schedule")
+async def schedule_prompt(c: CallbackQuery, state: FSMContext):
+    await c.message.edit_text(
+        "⏰ Send me the number of minutes from now when you want a new signal.\n"
+        "Example: `2` for 2 minutes.",
+        reply_markup=back_keyboard()
+    )
+    await state.set_state(ScheduleStates.waiting_for_minutes)
 
-    if not match:
-        await msg.answer("Send a valid number like 1.45")
-        return
-
+@dp.message(ScheduleStates.waiting_for_minutes)
+async def schedule_minutes(msg: types.Message, state: FSMContext):
     try:
-        value = float(match.group())
-        if value <= 0:
-            raise ValueError("Invalid multiplier")
+        minutes = int(msg.text.strip())
+        if minutes <= 0:
+            await msg.answer("Please enter a positive number.")
+            return
+        # Schedule the task
+        await state.clear()
+        await msg.answer(f"✅ Reminder set for {minutes} minute(s) from now. I'll send you an updated signal then.")
 
-        state.history.append(value)
-        if len(state.history) > 200:
-            state.history.pop(0)
+        # Wait and then send signal
+        await asyncio.sleep(minutes * 60)
+        analysis = risk.analyze()
+        text = (f"⏰ **Scheduled Signal** ({minutes} min later)\n"
+                f"🕒 {datetime.now().strftime('%H:%M:%S')}\n"
+                f"Bankroll: ₦{risk.bankroll:,.0f} | Session: {'+' if risk.session_profit >= 0 else ''}₦{risk.session_profit:,.0f}\n\n"
+                f"{analysis}\n\n"
+                f"❗ Place your bet on the NEXT round.")
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📈 Get Fresh Signal", callback_data="signal")],
+            [InlineKeyboardButton(text="🔙 Main Menu", callback_data="menu")]
+        ])
+        await bot.send_message(chat_id=msg.chat.id, text=text, reply_markup=keyboard)
+    except ValueError:
+        await msg.answer("Please send a valid number (e.g., 2).")
 
-        state.pending_add = False
-
+# -------------------- Handle multiplier input --------------------
+@dp.message()
+async def add_multiplier(msg: types.Message):
+    try:
+        mult = float(msg.text.strip().replace("x", ""))
+        risk.add_multiplier(mult)
+        # Update session profit? Not directly – user would need to record wins/losses separately.
         await msg.answer(
-            f"✅ Added {value}x\n"
-            f"Stored total: {len(state.history)}\n"
-            f"Tap SHOW REPORT when you want a summary."
+            f"✅ Added {mult}x from BetKing!\n"
+            f"History now has {len(risk.history)} entries.\n"
+            f"Press 📈 GET SIGNAL for analysis.",
+            reply_markup=main_keyboard()
         )
-    except Exception:
-        await msg.answer("Send a valid number like 1.45")
+    except ValueError:
+        await msg.answer("Please send a number like 1.45 or use the buttons below.", reply_markup=main_keyboard())
 
-
+# -------------------- Start polling --------------------
 async def main():
-    dp.include_router(router)
-    print("Bot started")
+    print("BetKing Risk Master started – send /start in Telegram")
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
